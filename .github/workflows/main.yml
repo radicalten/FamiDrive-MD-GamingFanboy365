@@ -35,7 +35,10 @@ jobs:
 
           output_dir = Path("roms/ci-inputs")
           output_dir.mkdir(parents=True, exist_ok=True)
+          for old_rom in output_dir.glob("*.nes"):
+              old_rom.unlink()
 
+          ines_magic = bytes((0x4E, 0x45, 0x53, 0x1A))
           with ZipFile(archive_path) as archive:
               entries = [
                   info for info in archive.infolist()
@@ -44,15 +47,25 @@ jobs:
               if not entries:
                   raise SystemExit(f"No .nes files found in {archive_path}.")
 
-              for index, info in enumerate(entries, start=1):
+              built_inputs = 0
+              for info in entries:
+                  data = archive.read(info)
+                  if data[:4] != ines_magic:
+                      print(f"Skipping {info.filename}: missing iNES header magic.")
+                      continue
+
+                  built_inputs += 1
                   member_name = info.filename.rsplit("/", 1)[-1]
                   stem = Path(member_name).stem
                   safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
                   if not safe_stem:
                       safe_stem = "rom"
-                  target = output_dir / f"{index:02d}_{safe_stem}.nes"
-                  target.write_bytes(archive.read(info))
+                  target = output_dir / f"{built_inputs:02d}_{safe_stem}.nes"
+                  target.write_bytes(data)
                   print(f"Extracted {info.filename} -> {target}")
+
+              if built_inputs == 0:
+                  raise SystemExit("No valid iNES ROMs found in the ZIP archive.")
           PY
 
       - name: Build each ROM with FPS counter
