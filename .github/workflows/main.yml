@@ -58,12 +58,18 @@ jobs:
       - name: Build Mega Drive ROM
         run: bash ./build.sh roms/test.nes
 
+      # The build script's canonical output is .bin; .md is a common alternate
+      # filename extension for Mega Drive ROMs, so include both names.
+      - name: Create .md-named ROM copy
+        run: cp out/rom_md.bin out/rom_md.md
+
       - name: Upload build output
         uses: actions/upload-artifact@v7
         with:
           name: famidrive-md-build-${{ github.sha }}
           path: |
             out/rom_md.bin
+            out/rom_md.md
             out/rom_md.lst
           if-no-files-found: error
           retention-days: 14
