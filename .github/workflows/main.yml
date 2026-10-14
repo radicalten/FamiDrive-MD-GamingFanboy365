@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Mega Drive ROM
+    name: Build NES ROMs for Mega Drive
     runs-on: ubuntu-latest
 
     steps:
@@ -22,9 +22,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Extract test NES ROM
+      - name: Extract all NES ROMs from ZIP
         run: |
           python - <<'PY'
+          import re
           from pathlib import Path
           from zipfile import ZipFile
 
@@ -32,44 +33,52 @@ jobs:
           if not archive_path.is_file():
               raise SystemExit(f"Missing {archive_path}; commit the ROM archive so Actions can access it.")
 
+          output_dir = Path("roms/ci-inputs")
+          output_dir.mkdir(parents=True, exist_ok=True)
+
           with ZipFile(archive_path) as archive:
               entries = [
-                  name for name in archive.namelist()
-                  if name.lower().endswith(".nes") and not name.endswith("/")
+                  info for info in archive.infolist()
+                  if not info.is_dir() and info.filename.lower().endswith(".nes")
               ]
-              # Prefer the member named test.nes, even if the ZIP contains other ROMs.
-              matches = [
-                  name for name in entries
-                  if name.rsplit("/", 1)[-1].casefold() == "test.nes"
-              ]
-              if len(matches) == 1:
-                  selected = matches[0]
-              elif not matches and len(entries) == 1:
-                  # If the ZIP has only one ROM, use it regardless of its internal filename.
-                  selected = entries[0]
-              else:
-                  raise SystemExit(
-                      "Could not uniquely select test.nes from the archive. "
-                      f"NES files found: {entries}"
-                  )
-              Path("roms/test.nes").write_bytes(archive.read(selected))
+              if not entries:
+                  raise SystemExit(f"No .nes files found in {archive_path}.")
+
+              for index, info in enumerate(entries, start=1):
+                  member_name = info.filename.rsplit("/", 1)[-1]
+                  stem = Path(member_name).stem
+                  safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
+                  if not safe_stem:
+                      safe_stem = "rom"
+                  target = output_dir / f"{index:02d}_{safe_stem}.nes"
+                  target.write_bytes(archive.read(info))
+                  print(f"Extracted {info.filename} -> {target}")
           PY
 
-      - name: Build Mega Drive ROM
-        run: bash ./build.sh roms/test.nes
+      - name: Build each ROM with FPS counter
+        shell: bash
+        run: |
+          shopt -s nullglob
+          roms=(roms/ci-inputs/*.nes)
+          if (( ${#roms[@]} == 0 )); then
+            echo "No .nes files were extracted." >&2
+            exit 1
+          fi
 
-      # The build script's canonical output is .bin; .md is a common alternate
-      # filename extension for Mega Drive ROMs, so include both names.
-      - name: Create .md-named ROM copy
-        run: cp out/rom_md.bin out/rom_md.md
+          mkdir -p out/roms
+          for rom in "${roms[@]}"; do
+            name="$(basename "$rom" .nes)"
+            echo "Building $rom with recompiler and FPS counter"
+            bash ./build.sh --recompile --fps "$rom"
+            cp out/rom_md.bin "out/roms/${name}.bin"
+            cp out/rom_md.bin "out/roms/${name}.md"
+            cp out/rom_md.lst "out/roms/${name}.lst"
+          done
 
       - name: Upload build output
         uses: actions/upload-artifact@v7
         with:
-          name: famidrive-md-build-${{ github.sha }}
-          path: |
-            out/rom_md.bin
-            out/rom_md.md
-            out/rom_md.lst
+          name: famidrive-md-builds-${{ github.sha }}
+          path: out/roms/
           if-no-files-found: error
           retention-days: 14
