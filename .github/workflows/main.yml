@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Build smoke-test ROM
+    name: Build Mega Drive ROM
     runs-on: ubuntu-latest
 
     steps:
@@ -22,38 +22,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The repository intentionally does not include NES game ROMs (roms/ is gitignored).
-      # Generate a tiny homebrew NROM so CI can verify the assembler/build pipeline without
-      # downloading or redistributing a game ROM.
-      - name: Create CI smoke-test NES ROM
+      - name: Extract test NES ROM
         run: |
           python - <<'PY'
           from pathlib import Path
+          from zipfile import ZipFile
 
-          header = bytearray(16)
-          header[:4] = b"NES\x1a"
-          header[4] = 1  # 16 KiB PRG-ROM
-          header[5] = 0  # CHR-RAM
+          archive_path = Path("roms/test.nes.zip")
+          if not archive_path.is_file():
+              raise SystemExit(f"Missing {archive_path}; commit the ROM archive so Actions can access it.")
 
-          prg = bytearray([0xEA] * 0x4000)
-          # SEI; CLD; LDX #$FF; TXS; JMP $8005 (idle loop)
-          prg[:8] = bytes((0x78, 0xD8, 0xA2, 0xFF, 0x9A, 0x4C, 0x05, 0x80))
-          # NMI, reset, and IRQ vectors all point to $8000.
-          for offset in (0x3FFA, 0x3FFC, 0x3FFE):
-              prg[offset:offset + 2] = b"\x00\x80"
-
-          rom_path = Path("roms/ci-smoke.nes")
-          rom_path.parent.mkdir(parents=True, exist_ok=True)
-          rom_path.write_bytes(header + prg)
+          with ZipFile(archive_path) as archive:
+              entries = [
+                  name for name in archive.namelist()
+                  if name.lower().endswith(".nes") and not name.endswith("/")
+              ]
+              if len(entries) != 1:
+                  raise SystemExit(
+                      f"Expected exactly one .nes file in {archive_path}, found {len(entries)}."
+                  )
+              Path("roms/test.nes").write_bytes(archive.read(entries[0]))
           PY
 
       - name: Build Mega Drive ROM
-        run: bash ./build.sh roms/ci-smoke.nes
+        run: bash ./build.sh roms/test.nes
 
       - name: Upload build output
         uses: actions/upload-artifact@v7
         with:
-          name: famidrive-md-smoke-build-${{ github.sha }}
+          name: famidrive-md-build-${{ github.sha }}
           path: |
             out/rom_md.bin
             out/rom_md.lst
