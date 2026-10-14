@@ -1,0 +1,61 @@
+name: Build FamiDrive-MD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build smoke-test ROM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # The repository intentionally does not include NES game ROMs (roms/ is gitignored).
+      # Generate a tiny homebrew NROM so CI can verify the assembler/build pipeline without
+      # downloading or redistributing a game ROM.
+      - name: Create CI smoke-test NES ROM
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          header = bytearray(16)
+          header[:4] = b"NES\x1a"
+          header[4] = 1  # 16 KiB PRG-ROM
+          header[5] = 0  # CHR-RAM
+
+          prg = bytearray([0xEA] * 0x4000)
+          # SEI; CLD; LDX #$FF; TXS; JMP $8005 (idle loop)
+          prg[:8] = bytes((0x78, 0xD8, 0xA2, 0xFF, 0x9A, 0x4C, 0x05, 0x80))
+          # NMI, reset, and IRQ vectors all point to $8000.
+          for offset in (0x3FFA, 0x3FFC, 0x3FFE):
+              prg[offset:offset + 2] = b"\x00\x80"
+
+          rom_path = Path("roms/ci-smoke.nes")
+          rom_path.parent.mkdir(parents=True, exist_ok=True)
+          rom_path.write_bytes(header + prg)
+          PY
+
+      - name: Build Mega Drive ROM
+        run: bash ./build.sh roms/ci-smoke.nes
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v7
+        with:
+          name: famidrive-md-smoke-build-${{ github.sha }}
+          path: |
+            out/rom_md.bin
+            out/rom_md.lst
+          if-no-files-found: error
+          retention-days: 14
