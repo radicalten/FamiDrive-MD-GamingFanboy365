@@ -37,11 +37,22 @@ jobs:
                   name for name in archive.namelist()
                   if name.lower().endswith(".nes") and not name.endswith("/")
               ]
-              if len(entries) != 1:
+              # Prefer the member named test.nes, even if the ZIP contains other ROMs.
+              matches = [
+                  name for name in entries
+                  if name.rsplit("/", 1)[-1].casefold() == "test.nes"
+              ]
+              if len(matches) == 1:
+                  selected = matches[0]
+              elif not matches and len(entries) == 1:
+                  # If the ZIP has only one ROM, use it regardless of its internal filename.
+                  selected = entries[0]
+              else:
                   raise SystemExit(
-                      f"Expected exactly one .nes file in {archive_path}, found {len(entries)}."
+                      "Could not uniquely select test.nes from the archive. "
+                      f"NES files found: {entries}"
                   )
-              Path("roms/test.nes").write_bytes(archive.read(entries[0]))
+              Path("roms/test.nes").write_bytes(archive.read(selected))
           PY
 
       - name: Build Mega Drive ROM
