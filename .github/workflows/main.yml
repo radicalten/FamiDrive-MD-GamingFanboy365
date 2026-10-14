@@ -50,8 +50,18 @@ jobs:
               built_inputs = 0
               for info in entries:
                   data = archive.read(info)
-                  if data[:4] != ines_magic:
-                      print(f"Skipping {info.filename}: missing iNES header magic.")
+                  if len(data) < 16 or data[:4] != ines_magic:
+                      print(f"Skipping {info.filename}: not a complete iNES ROM.")
+                      continue
+
+                  # Match recomp6502.py's mapper parsing. FPS/recompile mode supports
+                  # only mapper 0 (NROM) and mapper 3 (CNROM).
+                  mapper_high = data[7] & 0xF0
+                  if data[7] & 0x0C != 0x08 and any(data[12:16]):
+                      mapper_high = 0  # tolerate junk in old iNES headers
+                  mapper = (data[6] >> 4) | mapper_high
+                  if mapper not in (0, 3):
+                      print(f"Skipping {info.filename}: mapper {mapper} is unsupported; use mapper 0 or 3 for FPS builds.")
                       continue
 
                   built_inputs += 1
@@ -65,7 +75,7 @@ jobs:
                   print(f"Extracted {info.filename} -> {target}")
 
               if built_inputs == 0:
-                  raise SystemExit("No valid iNES ROMs found in the ZIP archive.")
+                  raise SystemExit("No supported iNES ROMs found (FPS builds require mapper 0 or 3).")
           PY
 
       - name: Build each ROM with FPS counter
