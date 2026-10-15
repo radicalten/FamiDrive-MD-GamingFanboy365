@@ -54,14 +54,19 @@ jobs:
                       print(f"Skipping {info.filename}: not a complete iNES ROM.")
                       continue
 
-                  # Match recomp6502.py's mapper parsing. FPS/recompile mode supports
-                  # only mapper 0 (NROM) and mapper 3 (CNROM).
+                  # Match recomp6502.py and md.asm's header checks. FPS/recompile mode
+                  # supports mapper 0 (NROM) and mapper 3 (CNROM) with 1 or 2 16 KB PRG banks.
                   mapper_high = data[7] & 0xF0
                   if data[7] & 0x0C != 0x08 and any(data[12:16]):
                       mapper_high = 0  # tolerate junk in old iNES headers
                   mapper = (data[6] >> 4) | mapper_high
                   if mapper not in (0, 3):
                       print(f"Skipping {info.filename}: mapper {mapper} is unsupported; use mapper 0 or 3 for FPS builds.")
+                      continue
+
+                  prg_banks = data[4]
+                  if prg_banks not in (1, 2) or len(data) < 16 + prg_banks * 0x4000:
+                      print(f"Skipping {info.filename}: unsupported or truncated PRG-ROM size ({prg_banks} x 16 KB).")
                       continue
 
                   built_inputs += 1
@@ -76,6 +81,32 @@ jobs:
 
               if built_inputs == 0:
                   raise SystemExit("No supported iNES ROMs found (FPS builds require mapper 0 or 3).")
+          PY
+
+      - name: Normalize forward BSR widths for ASL multi-pass FPS builds
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          # Commit 5982d73 added `bsr.s .hide` in emu/fps.asm 4 bytes before `.hide:`.
+          # When unsuffixed forward `bsr` instructions in emu/*.asm expand between ASL
+          # Pass 2 and Pass 3 (+6 bytes, or +4 bytes after `align 4` in out/recomp.asm),
+          # Pass 3 sees a temporary 0-byte displacement at `bsr.s .hide` and fails with
+          # `fps.asm(115): error: jump distance too big`. Pinning these to `bsr.w` keeps
+          # pass sizes stable.
+          fps_path = Path("emu/fps.asm")
+          if fps_path.is_file():
+              fps_text = fps_path.read_text()
+              fps_text = re.sub(r"\bbsr\.s(\s+\.(?:hide|links))\b", r"bsr.w\1", fps_text)
+              fps_path.write_text(fps_text)
+
+          for asm_name in ("emu/ppu.asm", "emu/apu.asm", "emu/memory.asm"):
+              asm_path = Path(asm_name)
+              if asm_path.is_file():
+                  asm_text = asm_path.read_text()
+                  asm_text = re.sub(r"^(\s*bsr)\t", r"\1.w\t", asm_text, flags=re.M)
+                  asm_path.write_text(asm_text)
           PY
 
       - name: Build each ROM with FPS counter
