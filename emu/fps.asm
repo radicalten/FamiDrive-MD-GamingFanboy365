@@ -20,7 +20,7 @@
 ; it takes the last two NES sprite slots.
 ; ----------------------------------------------------------------
 
-fpsTiles	equ $201			; digit tiles, after the blank tile $200
+fpsTiles	equ $301			; digit tiles, after the NES tile sets ($000-$2FF)
 fpsSprite	equ 62				; first sprite slot used
 fpsX		equ $80+256-8-16		; MD sprite coordinates
 fpsY		equ $80+8
@@ -112,7 +112,7 @@ fpsUpdate:
 		beq.s	.done				; slots until the game rewrites them
 		clr.w	fpsWasOn(a4)
 		lea	vdpSprData+fpsSprite*8(a4),a5	; (both tables: one still
-		bsr.s	.hide				; links to the counter until
+		bsr.w	.hide				; links to the counter until
 		lea	vdpSprData2+fpsSprite*8(a4),a5	; the game's next OAM DMA)
 .hide:
 		move.w	#0,(a5)				; above the screen
