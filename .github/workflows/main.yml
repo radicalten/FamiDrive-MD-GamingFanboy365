@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build NES ROMs for Mega Drive
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -22,114 +23,221 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Extract all NES ROMs from ZIP
+      - name: Extract supported NES ROMs from roms/
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
+          import os
           import re
           from pathlib import Path
-          from zipfile import ZipFile
+          from zipfile import BadZipFile, ZipFile
 
-          archive_path = Path("roms/test.nes.zip")
-          if not archive_path.is_file():
-              raise SystemExit(f"Missing {archive_path}; commit the ROM archive so Actions can access it.")
+          roms_dir = Path("roms")
+          archives = sorted(roms_dir.glob("*.zip"))
+          loose = sorted(roms_dir.glob("*.nes"))
+          if not archives and not loose:
+              raise SystemExit(
+                  "Missing roms/*.zip or roms/*.nes; commit the ROM archive so Actions can access it."
+              )
 
           output_dir = Path("roms/ci-inputs")
           output_dir.mkdir(parents=True, exist_ok=True)
-          for old_rom in output_dir.glob("*.nes"):
-              old_rom.unlink()
+          for stale in output_dir.iterdir():
+              if stale.is_file():
+                  stale.unlink()
+
+          # What md.asm (Fami_LoadRom), tools/nesinfo.py and tools/recomp6502.py agree on:
+          # mappers 0 (NROM), 2 (UxROM), 3 (CNROM) and 4 (MMC3), with 16 or 32 KB of PRG-ROM
+          # unless the mapper is banked (2 and 4, which lay out a 32 KB image per 16 KB bank,
+          # so 32 KB to 512 KB). CHR-ROM and CHR-RAM both work.
+          mapper_names = {0: "NROM", 2: "UxROM", 3: "CNROM", 4: "MMC3"}
+          banked = (2, 4)
 
           ines_magic = bytes((0x4E, 0x45, 0x53, 0x1A))
-          with ZipFile(archive_path) as archive:
-              entries = [
-                  info for info in archive.infolist()
-                  if not info.is_dir() and info.filename.lower().endswith(".nes")
-              ]
-              if not entries:
-                  raise SystemExit(f"No .nes files found in {archive_path}.")
+          candidates = []
+          for archive_path in archives:
+              try:
+                  with ZipFile(archive_path) as archive:
+                      for info in archive.infolist():
+                          parts = info.filename.split("/")
+                          if info.is_dir() or not info.filename.lower().endswith(".nes"):
+                              continue
+                          if "__MACOSX" in parts or parts[-1].startswith("._"):
+                              continue  # macOS metadata, not a ROM
+                          candidates.append(
+                              (f"{archive_path.name}:{info.filename}", archive.read(info))
+                          )
+              except BadZipFile:
+                  raise SystemExit(f"{archive_path} is not a ZIP file.")
+          for path in loose:
+              candidates.append((str(path), path.read_bytes()))
 
-              built_inputs = 0
-              for info in entries:
-                  data = archive.read(info)
-                  if len(data) < 16 or data[:4] != ines_magic:
-                      print(f"Skipping {info.filename}: not a complete iNES ROM.")
-                      continue
+          def read_mapper(data):
+              """The mapper number as recomp6502.py, tools/nesinfo.py and md.asm read it: old dumps
+              can have junk (e.g. "DiskDude!") in bytes 7-15, ignored unless it's NES 2.0."""
+              mapper_high = data[7] & 0xF0
+              if data[7] & 0x0C != 0x08 and any(data[12:16]):
+                  mapper_high = 0
+              return (data[6] >> 4) | mapper_high
 
-                  # Match recomp6502.py and md.asm's header checks. FPS/recompile mode
-                  # supports mapper 0 (NROM) and mapper 3 (CNROM) with 1 or 2 16 KB PRG banks.
-                  mapper_high = data[7] & 0xF0
-                  if data[7] & 0x0C != 0x08 and any(data[12:16]):
-                      mapper_high = 0  # tolerate junk in old iNES headers
-                  mapper = (data[6] >> 4) | mapper_high
-                  if mapper not in (0, 3):
-                      print(f"Skipping {info.filename}: mapper {mapper} is unsupported; use mapper 0 or 3 for FPS builds.")
-                      continue
+          def reject(label, data):
+              """Why FamiDrive can't build this ROM, or None if it can."""
+              if len(data) < 16 or data[:4] != ines_magic:
+                  return "not a complete iNES ROM"
+              if data[6] & 0x04:
+                  return "it has a 512-byte trainer, and Fami_LoadRom reads PRG-ROM from offset 16"
+              mapper = read_mapper(data)
+              if mapper not in mapper_names:
+                  return f"mapper {mapper} is unsupported (FamiDrive runs mappers 0, 2, 3 and 4)"
+              prg16, chr8 = data[4], data[5]
+              if mapper in banked:
+                  if not 2 <= prg16 <= 32:
+                      return (
+                          f"mapper {mapper} ({mapper_names[mapper]}) needs 32 KB to 512 KB of "
+                          f"PRG-ROM, not {prg16 * 16} KB"
+                      )
+              elif prg16 not in (1, 2):
+                  return (
+                      f"mapper {mapper} ({mapper_names[mapper]}) needs 16 KB or 32 KB of "
+                      f"PRG-ROM, not {prg16 * 16} KB"
+                  )
+              if len(data) < 16 + prg16 * 0x4000 + chr8 * 0x2000:
+                  return (
+                      f"it is truncated: {len(data)} bytes, but its header says "
+                      f"{prg16 * 16} KB of PRG-ROM and {chr8 * 8} KB of CHR-ROM"
+                  )
+              return None
 
-                  prg_banks = data[4]
-                  if prg_banks not in (1, 2) or len(data) < 16 + prg_banks * 0x4000:
-                      print(f"Skipping {info.filename}: unsupported or truncated PRG-ROM size ({prg_banks} x 16 KB).")
-                      continue
+          accepted, skipped = [], []
+          for label, data in candidates:
+              reason = reject(label, data)
+              if reason:
+                  skipped.append((label, reason))
+                  print(f"Skipping {label}: {reason}")
+                  print(f"::warning title=Skipped ROM::{label}: {reason}")
+                  continue
+              accepted.append((label, read_mapper(data), data[4], data[5], data))
 
-                  built_inputs += 1
-                  member_name = info.filename.rsplit("/", 1)[-1]
-                  stem = Path(member_name).stem
-                  safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._")
-                  if not safe_stem:
-                      safe_stem = "rom"
-                  target = output_dir / f"{built_inputs:02d}_{safe_stem}.nes"
-                  target.write_bytes(data)
-                  print(f"Extracted {info.filename} -> {target}")
+          if not accepted:
+              raise SystemExit("No supported iNES ROMs found (FamiDrive runs mappers 0, 2, 3 and 4).")
 
-              if built_inputs == 0:
-                  raise SystemExit("No supported iNES ROMs found (FPS builds require mapper 0 or 3).")
-          PY
+          plan = []
+          for index, (label, mapper, prg16, chr8, data) in enumerate(sorted(accepted), start=1):
+              member_name = Path(label.rsplit(":", 1)[-1]).stem
+              safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "_", member_name).strip("._")
+              name = f"{index:02d}_{safe_stem or 'rom'}"
+              target = output_dir / f"{name}.nes"
+              target.write_bytes(data)
+              plan.append((name, label, mapper, prg16, chr8))
+              chr_text = f"CHR-ROM {chr8 * 8} KB" if chr8 else "CHR-RAM"
+              print(
+                  f"Extracted {label} -> {target} (mapper {mapper} {mapper_names[mapper]}, "
+                  f"PRG-ROM {prg16 * 16} KB, {chr_text})"
+              )
 
-      - name: Normalize forward BSR widths for ASL multi-pass FPS builds
-        run: |
-          python - <<'PY'
-          import re
-          from pathlib import Path
-
-          # Commit 5982d73 added `bsr.s .hide` in emu/fps.asm 4 bytes before `.hide:`.
-          # When unsuffixed forward `bsr` instructions in emu/*.asm expand between ASL
-          # Pass 2 and Pass 3 (+6 bytes, or +4 bytes after `align 4` in out/recomp.asm),
-          # Pass 3 sees a temporary 0-byte displacement at `bsr.s .hide` and fails with
-          # `fps.asm(115): error: jump distance too big`. Pinning these to `bsr.w` keeps
-          # pass sizes stable.
-          fps_path = Path("emu/fps.asm")
-          if fps_path.is_file():
-              fps_text = fps_path.read_text()
-              fps_text = re.sub(r"\bbsr\.s(\s+\.(?:hide|links))\b", r"bsr.w\1", fps_text)
-              fps_path.write_text(fps_text)
-
-          for asm_name in ("emu/ppu.asm", "emu/apu.asm", "emu/memory.asm"):
-              asm_path = Path(asm_name)
-              if asm_path.is_file():
-                  asm_text = asm_path.read_text()
-                  asm_text = re.sub(r"^(\s*bsr)\t", r"\1.w\t", asm_text, flags=re.M)
-                  asm_path.write_text(asm_text)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a") as out:
+                  out.write(f"### ROMs from {', '.join(a.name for a in archives) or 'roms/'}\n\n")
+                  out.write("| ROM | Mapper | PRG-ROM | CHR-ROM |\n| --- | --- | --- | --- |\n")
+                  for name, label, mapper, prg16, chr8 in plan:
+                      chr_text = f"{chr8 * 8} KB" if chr8 else "RAM"
+                      out.write(
+                          f"| `{label}` | {mapper} ({mapper_names[mapper]}) | "
+                          f"{prg16 * 16} KB | {chr_text} |\n"
+                      )
+                  if skipped:
+                      out.write("\nSkipped:\n\n")
+                      for label, reason in skipped:
+                          out.write(f"- `{label}`: {reason}\n")
+                  out.write("\n")
           PY
 
       - name: Build each ROM with FPS counter
         shell: bash
         run: |
+          set -uo pipefail
           shopt -s nullglob
+
           roms=(roms/ci-inputs/*.nes)
           if (( ${#roms[@]} == 0 )); then
             echo "No .nes files were extracted." >&2
             exit 1
           fi
 
+          # A forward branch or call to a label further on must have an explicit size (`bsr.w`,
+          # `jsr (label).l`): AS takes it as short in its first pass, and if the code grows, a
+          # short forward branch fails with "jump distance too big" (see CLAUDE.md). Upstream
+          # fixed the one in emu/fps.asm, so builds usually pass as they are; if one doesn't,
+          # pin the remaining unsized ones and try again rather than failing the whole run.
+          normalize_bsr() {
+            python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          for asm_path in sorted(Path("emu").glob("*.asm")):
+              asm_text = asm_path.read_text()
+              fixed = re.sub(r"^(\s*bsr)\t", r"\1.w\t", asm_text, flags=re.M)
+              fixed = re.sub(r"\bbsr\.s(\s+\.(?:hide|links))\b", r"bsr.w\1", fixed)
+              if fixed != asm_text:
+                  asm_path.write_text(fixed)
+                  print(f"Pinned forward bsr sizes in {asm_path}")
+          PY
+          }
+
           mkdir -p out/roms
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          {
+            echo "### Builds"
+            echo
+            echo "| ROM | Mapper | Mega Drive ROM |"
+            echo "| --- | --- | --- |"
+          } >> "$summary"
+
+          failed=0
           for rom in "${roms[@]}"; do
             name="$(basename "$rom" .nes)"
-            echo "Building $rom with recompiler and FPS counter"
-            bash ./build.sh --recompile --fps "$rom"
-            cp out/rom_md.bin "out/roms/${name}.bin"
-            cp out/rom_md.bin "out/roms/${name}.md"
-            cp out/rom_md.lst "out/roms/${name}.lst"
+            log="$(mktemp)"
+            echo "::group::Building $name (recompiled, with FPS counter)"
+            rm -f out/rom_md.bin out/rom_md.lst out/nes_info.asm
+
+            built=1
+            bash ./build.sh --recompile --fps "$rom" 2>&1 | tee "$log" || built=0
+            if (( built == 0 )) && grep -qE "jump distance too big|addressing mode not allowed" "$log"; then
+              echo "Assembler pass sizing failed; retrying $name with explicit branch sizes" >&2
+              normalize_bsr
+              built=1
+              bash ./build.sh --recompile --fps "$rom" || built=0
+            fi
+
+            if (( built == 1 )) && [[ -f out/rom_md.bin ]]; then
+              cp out/rom_md.bin "out/roms/${name}.bin"
+              cp out/rom_md.bin "out/roms/${name}.md"
+              cp out/rom_md.lst "out/roms/${name}.lst"
+              mapper="$(awk '/^NES_MAPPER/ {print $3}' out/nes_info.asm)"
+              size="$(stat -c %s out/rom_md.bin)"
+              echo "Built out/roms/${name}.md: $(numfmt --to=iec "$size"), mapper ${mapper}"
+              echo "| \`${name}\` | ${mapper} | $(numfmt --to=iec "$size") |" >> "$summary"
+            else
+              echo "::error title=Build failed::${name} did not build; see the log above"
+              echo "| \`${name}\` | | **failed** |" >> "$summary"
+              failed=$(( failed + 1 ))
+            fi
+
+            rm -f "$log"
+            echo "::endgroup::"
           done
 
+          # out/recomp.asm is the game's own code, translated: never upload it
+          rm -f out/recomp.asm
+
+          if (( failed > 0 )); then
+            echo "::error::${failed} of ${#roms[@]} ROM(s) did not build."
+            exit 1
+          fi
+          echo "Built ${#roms[@]} ROM(s)."
+
       - name: Upload build output
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: famidrive-md-builds-${{ github.sha }}
