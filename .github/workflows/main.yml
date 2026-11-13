@@ -48,7 +48,9 @@ jobs:
           # What md.asm (Fami_LoadRom), tools/nesinfo.py and tools/recomp6502.py agree on:
           # mappers 0 (NROM), 2 (UxROM), 3 (CNROM) and 4 (MMC3), with 16 or 32 KB of PRG-ROM
           # unless the mapper is banked (2 and 4, which lay out a 32 KB image per 16 KB bank,
-          # so 32 KB to 512 KB). CHR-ROM and CHR-RAM both work.
+          # so 32 KB to 512 KB). CHR-ROM and CHR-RAM both work. Mapper 4 is how Super Mario
+          # Bros. 3 runs: PRG mode 1 (8 KB banks at $A000 and $C000, PRG_FRAMES), its CHR-ROM
+          # as MD tiles for the bank switches (CHR_MD) and its scanline IRQ (MMC3_IRQ).
           mapper_names = {0: "NROM", 2: "UxROM", 3: "CNROM", 4: "MMC3"}
           banked = (2, 4)
 
@@ -78,6 +80,28 @@ jobs:
               if data[7] & 0x0C != 0x08 and any(data[12:16]):
                   mapper_high = 0
               return (data[6] >> 4) | mapper_high
+
+          def mmc3_flags(data):
+              """For an MMC3 ROM, the (PRG mode 1, scanline IRQ) its code sets up,
+              as tools/nesinfo.py reads it: an immediate value with bit 6 set stored
+              to $8000, and a store to $E001."""
+              prg16 = data[4]
+              prg = data[16:16 + prg16 * 0x4000]
+              mode1 = any(
+                  m.group(1)[0] & 0x40
+                  for m in re.finditer(rb'[\xA9\xA2\xA0](.)[\x8D\x8E\x8C]\x00\x80', prg, re.S)
+              )
+              irq = re.search(rb'[\x8D\x8E\x8C]\x01\xE0', prg) is not None
+              return mode1, irq
+
+          def mapper_text(mapper, data):
+              text = f"{mapper} ({mapper_names[mapper]}"
+              if mapper == 4:
+                  mode1, irq = mmc3_flags(data)
+                  text += ", " + ("PRG mode 1" if mode1 else "PRG mode 0")
+                  if irq:
+                      text += ", scanline IRQ"
+              return text + ")"
 
           def reject(label, data):
               """Why FamiDrive can't build this ROM, or None if it can."""
@@ -127,10 +151,10 @@ jobs:
               name = f"{index:02d}_{safe_stem or 'rom'}"
               target = output_dir / f"{name}.nes"
               target.write_bytes(data)
-              plan.append((name, label, mapper, prg16, chr8))
+              plan.append((name, label, mapper, prg16, chr8, data))
               chr_text = f"CHR-ROM {chr8 * 8} KB" if chr8 else "CHR-RAM"
               print(
-                  f"Extracted {label} -> {target} (mapper {mapper} {mapper_names[mapper]}, "
+                  f"Extracted {label} -> {target} (mapper {mapper_text(mapper, data)}, "
                   f"PRG-ROM {prg16 * 16} KB, {chr_text})"
               )
 
@@ -139,10 +163,10 @@ jobs:
               with open(summary, "a") as out:
                   out.write(f"### ROMs from {', '.join(a.name for a in archives) or 'roms/'}\n\n")
                   out.write("| ROM | Mapper | PRG-ROM | CHR-ROM |\n| --- | --- | --- | --- |\n")
-                  for name, label, mapper, prg16, chr8 in plan:
+                  for name, label, mapper, prg16, chr8, data in plan:
                       chr_text = f"{chr8 * 8} KB" if chr8 else "RAM"
                       out.write(
-                          f"| `{label}` | {mapper} ({mapper_names[mapper]}) | "
+                          f"| `{label}` | {mapper_text(mapper, data)} | "
                           f"{prg16 * 16} KB | {chr_text} |\n"
                       )
                   if skipped:
@@ -198,7 +222,7 @@ jobs:
             name="$(basename "$rom" .nes)"
             log="$(mktemp)"
             echo "::group::Building $name (recompiled, with FPS counter)"
-            rm -f out/rom_md.bin out/rom_md.lst out/nes_info.asm
+            rm -f out/rom_md.bin out/rom_md.lst out/nes_info.asm out/recomp.asm out/chr_md.bin
 
             built=1
             bash ./build.sh --recompile --fps "$rom" 2>&1 | tee "$log" || built=0
@@ -214,9 +238,30 @@ jobs:
               cp out/rom_md.bin "out/roms/${name}.md"
               cp out/rom_md.lst "out/roms/${name}.lst"
               mapper="$(awk '/^NES_MAPPER/ {print $3}' out/nes_info.asm)"
+              prg1="$(awk '/^NES_MMC3_PRG1/ {print $3}' out/nes_info.asm)"
+              irq="$(awk '/^NES_MMC3_IRQ/ {print $3}' out/nes_info.asm)"
+              case "$mapper" in
+                0) mapper_name="NROM" ;;
+                2) mapper_name="UxROM" ;;
+                3) mapper_name="CNROM" ;;
+                4) mapper_name="MMC3" ;;
+                *) mapper_name="?" ;;
+              esac
+              mmc3=""
+              if [ "$mapper" = "4" ]; then
+                if [ "$prg1" = "1" ]; then
+                  mmc3=", PRG mode 1"
+                else
+                  mmc3=", PRG mode 0"
+                fi
+                if [ "$irq" = "1" ]; then
+                  mmc3="${mmc3}, scanline IRQ"
+                fi
+              fi
+              mapper_text="${mapper} (${mapper_name}${mmc3})"
               size="$(stat -c %s out/rom_md.bin)"
-              echo "Built out/roms/${name}.md: $(numfmt --to=iec "$size"), mapper ${mapper}"
-              echo "| \`${name}\` | ${mapper} | $(numfmt --to=iec "$size") |" >> "$summary"
+              echo "Built out/roms/${name}.md: $(numfmt --to=iec "$size"), mapper ${mapper_text}"
+              echo "| \`${name}\` | ${mapper_text} | $(numfmt --to=iec "$size") |" >> "$summary"
             else
               echo "::error title=Build failed::${name} did not build; see the log above"
               echo "| \`${name}\` | | **failed** |" >> "$summary"
